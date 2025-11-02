@@ -249,6 +249,10 @@ class Asset:
         if asset_type == self.AssetType.OPTION:
             self.multiplier = 100
 
+        # Note: Futures multipliers should be fetched from data provider (e.g., DataBento)
+        # at the data source level, not hardcoded here. The Asset class accepts multiplier
+        # as a parameter if the data source provides it.
+
         # Make sure right is upper case
         if right is not None:
             self.right = right.upper()
@@ -707,35 +711,16 @@ class Asset:
         if reference_date is None:
             reference_date = datetime.now()
 
-        current_month = reference_date.month
-        current_year = reference_date.year
-        current_day = reference_date.day
+        # import logging
+        # logger = logging.getLogger(__name__)
+        # logger.info(f"[CONTRACT RESOLUTION] symbol={self.symbol}, reference_date={reference_date}, month={reference_date.month}, day={reference_date.day}")
 
-        # Use quarterly contracts (Mar, Jun, Sep, Dec) with a mid-month roll rule
-        if current_month == 12 and current_day >= 15:
-            target_month = 3
-            target_year = current_year + 1
-        elif current_month >= 10:
-            target_month = 12
-            target_year = current_year
-        elif current_month == 9 and current_day >= 15:
-            target_month = 12
-            target_year = current_year
-        elif current_month >= 7:
-            target_month = 9
-            target_year = current_year
-        elif current_month == 6 and current_day >= 15:
-            target_month = 9
-            target_year = current_year
-        elif current_month >= 4:
-            target_month = 6
-            target_year = current_year
-        elif current_month == 3 and current_day >= 15:
-            target_month = 6
-            target_year = current_year
-        else:
-            target_month = 3
-            target_year = current_year
+        from lumibot.tools import futures_roll
+
+        target_year, target_month = futures_roll.determine_contract_year_month(
+            self.symbol,
+            reference_date,
+        )
 
         month_code = FUTURES_MONTH_CODES.get(target_month, "U")
         base_contract = f"{self.symbol}{month_code}"

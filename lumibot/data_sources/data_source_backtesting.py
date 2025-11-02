@@ -68,16 +68,44 @@ class DataSourceBacktesting(DataSource, ABC):
         # catch it here and ignore it in this class. Child classes that need it should error check it themselves.
         self._config = config
 
-        # If false, we don't show the progress bar
-        # Also disable progress bar if BACKTESTING_QUIET_LOGS is enabled
-        import os
-        quiet_logs_enabled = os.environ.get("BACKTESTING_QUIET_LOGS", "").lower() == "true"
-        self._show_progress_bar = show_progress_bar and not quiet_logs_enabled
+        # Progress bar should always show when enabled, regardless of quiet_logs
+        # Quiet logs only affects INFO/WARNING/ERROR logging, not progress bar
+        self._show_progress_bar = show_progress_bar
 
         self._progress_csv_path = "logs/progress.csv"
         # Add initialization for the logging timer attribute
         self._last_logging_time = None
         self._portfolio_value = None
+
+    @staticmethod
+    def estimate_requested_length(length=None, start_date=None, end_date=None, timestep="minute"):
+        """
+        Infer the number of rows required to satisfy a backtest data request.
+        """
+        if length is not None:
+            try:
+                return max(int(length), 1)
+            except (TypeError, ValueError):
+                pass
+
+        if start_date is None or end_date is None:
+            return 1
+
+        try:
+            td, unit = DataSource.convert_timestep_str_to_timedelta(timestep)
+        except Exception:
+            return 1
+
+        if end_date < start_date:
+            start_date, end_date = end_date, start_date
+
+        if unit == "day":
+            delta_days = (end_date.date() - start_date.date()).days
+            return max(delta_days + 1, 1)
+
+        interval_seconds = max(td.total_seconds(), 1)
+        total_seconds = max((end_date - start_date).total_seconds(), 0)
+        return max(int(total_seconds // interval_seconds) + 1, 1)
 
     def get_datetime(self, adjust_for_delay=False):
         """
