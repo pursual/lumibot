@@ -107,7 +107,75 @@ class SchwabData(DataSource):
         self.client = client
         logger.info(colored("Schwab client set for data source", "green"))
 
-    def get_chains(self, asset: Asset, quote: Asset = None, exchange: str = None, strike_count: int = 100) -> dict:
+    def query_greeks(self, asset: Asset):
+        """
+        Get the option greeks for an option asset via Schwab Data API.
+        Returns a dict mapping greek names to float values, e.g., {'delta': ..., 'gamma': ..., 'theta': ..., 'vega': ..., 'rho': ...}.
+        """
+        # Only options have greeks
+        if asset.asset_type != Asset.AssetType.OPTION:
+            return {}
+        
+        contract_type = self.client.Options.ContractType.CALL if asset.right == Asset.OptionRight.CALL else self.client.Options.ContractType.PUT if asset.right == Asset.OptionRight.PUT else None
+        if contract_type is None:
+            logger.error(f"Error fetching greeks from Schwab Data API: Unknown contract type for {asset}")
+            return {}
+        
+        # we have to use the get chain api to get the greeks
+        params = {
+            "symbol": asset.symbol,
+            "contract_type": contract_type,
+            "strategy": self.client.Options.Strategy.SINGLE,
+            "include_underlying_quote": False,
+            "strike": asset.strike,
+            "from_date": asset.expiration,
+            "to_date": asset.expiration,
+        }
+
+        try:
+            response = self.client.get_option_chain(**params)
+
+            # Process response
+            if not response:
+                logger.error(colored(f"No response from API for {asset.symbol}", "red"))
+                return {}
+
+            if hasattr(response, 'status_code') and response.status_code == 200:
+                data = response.json()
+
+                contract = data.get("callExpDateMap") if contract_type == self.client.Options.ContractType.CALL else data.get("putExpDateMap")
+                if len(contract) != 1:
+                    logger.error(colored(f"Unexpected number of contract dates found for {asset.symbol}", "red"))
+                    return {}
+                contract = next(iter(contract.values()))
+                if len(contract) != 1:
+                    logger.error(colored(f"Unexpected number of contract strikes found for {asset.symbol}", "red"))
+                    return {}
+                contract = next(iter(contract.values()))
+                # we now have a list
+                if len(contract) != 1:
+                    logger.error(colored(f"Unexpected number of contract options found for {asset.symbol}", "red"))
+                    return {}
+                contract = contract[0]
+
+                return {
+                    'delta': contract.get('delta'),
+                    'gamma': contract.get('gamma'),
+                    'theta': contract.get('theta'),
+                    'vega': contract.get('vega'),
+                    'rho': contract.get('rho'),
+                }
+            else:
+                logger.error(colored(f"Error fetching options for {asset.symbol}: {response.status_code}", "red"))
+                return {}
+            
+            
+        except Exception as e:
+            logger.error(f"Error fetching greeks from Schwab Data API: {e}")
+            return {}
+
+    
+    def get_chains(self, asset: Asset, quote: Asset = None, exchange: str = None, strike_count: int = 100, raw: bool = False) -> dict:
         """
         Obtains option chain information for the asset (stock) from each
         of the exchanges the options trade on and returns a dictionary
@@ -143,7 +211,8 @@ class SchwabData(DataSource):
         chains = {
             "Multiplier": 100,  # Standard option contracts are for 100 shares
             "Exchange": "SMART",  # Default exchange routing
-            "Chains": {"CALL": {}, "PUT": {}}
+            "Chains": {"CALL": {}, "PUT": {}},
+            "raw": {"CALL": {}, "PUT": {}},
         }
 
         try:
@@ -220,14 +289,17 @@ class SchwabData(DataSource):
 
                     # Initialize list to store strikes for this expiration
                     chains["Chains"][option_type][exp_date] = []
+                    chains["raw"][option_type][exp_date] = []
 
                     # Add all available strikes for this expiration date
                     for strike_str, strike_data in strikes_data.items():
                         strike = float(strike_str)
                         chains["Chains"][option_type][exp_date].append(strike)
+                        chains["raw"][option_type][exp_date].append(strike_data[0])
 
                     # Sort the strikes in ascending order
                     chains["Chains"][option_type][exp_date].sort()
+                    chains["raw"][option_type][exp_date].sort(key=lambda x: float(x['strikePrice']))
 
                 return True
 
@@ -259,6 +331,9 @@ class SchwabData(DataSource):
 
             if not success:
                 logger.error(colored(f"No option data found for {asset.symbol}", "red"))
+
+            if raw:
+                return chains["raw"]
 
             # Wrap into Chains entity for richer interface (backwards-compatible: Chains inherits dict)
             try:
