@@ -476,6 +476,7 @@ class Schwab(Broker):
                         expiration=option_parts['expiry_date'],
                         strike=option_parts['strike_price'],
                         right=option_parts['option_type'],
+                        underlying_asset=Asset(instrument.get('underlyingSymbol')),
                     )
                 elif asset_type == 'FUTURE':
                     asset = Asset(
@@ -839,12 +840,18 @@ class Schwab(Broker):
             }
 
             schwab_order_type = schwab_order.get("orderType", None)
+            price = schwab_order.get("price", None)
+
+            if schwab_order_type == "NET_CREDIT" or schwab_order_type == "NET_DEBIT":
+                if price is None:
+                    schwab_order_type = "MARKET"
+                else:
+                    schwab_order_type = "LIMIT"
+            
+
             order_type = order_type_map.get(schwab_order_type)
 
-            if not order_type and schwab_order_type == "NET_CREDIT":
-                logger.info(colored(f"NET_CREDIT order type not supported: {schwab_order.get('orderId', '')}", "yellow"))
-                return []
-            elif not order_type:
+            if not order_type:
                 logger.error(colored(f"Unknown order type: {schwab_order_type}", "red"))
                 return []
 
@@ -1055,7 +1062,7 @@ class Schwab(Broker):
     # Unimplemented methods with stubs
     def _get_stream_object(self):
         """Get the broker stream connection"""
-        stream = PollingStream(5.0)  # 5 seconds polling interval
+        stream = PollingStream(2.0)  # 5 seconds polling interval
         return stream
 
     def _register_stream_events(self):
@@ -1074,12 +1081,95 @@ class Schwab(Broker):
                     broker._last_position_sync_time = current_time
 
                 # Always check for new orders
-                orders = broker._pull_broker_all_orders()
-                for order_data in orders:
+                raw_orders = broker._pull_broker_all_orders()
+                stored_orders = {x.identifier: x for x in self.get_all_orders()}
+                for order_data in raw_orders:
                     order = broker._parse_broker_order(order_data, broker._strategy_name)
                     if order:
                         # Process each new order without checking against a nonexistent _orders attribute
-                        broker._process_new_order(order)
+                        # broker._process_new_order(order)
+
+
+
+                        # Check if this order exists in our stored orders
+                        if order.identifier in stored_orders:
+                            stored_order = stored_orders[order.identifier]
+
+                            # Check if the status has changed
+                            if stored_order.status != order.status:
+                                logger.debug(f"Schwab: Order status changed - {order.identifier}: {stored_order.status} -> {order.status}")
+
+                                # Update the stored order with new data and dispatch the event
+                                stored_order.update_raw(order_data)
+
+                                # Dispatch the appropriate event based on the new status
+                                if order.status == "filled" or order.status == "fill":
+                                    # Get price and quantity with proper fallbacks for Alpaca API
+                                    price = getattr(order, 'avg_fill_price', None) or getattr(order, 'limit_price', None)
+                                    filled_qty = getattr(order, 'quantity', None)
+                                    self.stream.dispatch(self.FILLED_ORDER, order=stored_order, price=price, filled_quantity=filled_qty)
+                                elif order.status == "partially_filled":
+                                    pass
+                                    # Get price and quantity with proper fallbacks for Alpaca API
+                                    # price = (getattr(alpaca_order, 'filled_avg_price', None) or
+                                    #     getattr(alpaca_order, 'avg_fill_price', None) or
+                                    #     getattr(order, 'limit_price', None))
+                                    # filled_qty = (getattr(alpaca_order, 'filled_qty', None) or
+                                    #             getattr(alpaca_order, 'qty', None) or
+                                    #             getattr(order, 'quantity', None))
+                                    # self.stream.dispatch(self.PARTIALLY_FILLED_ORDER, order=stored_order, price=price, filled_quantity=filled_qty)
+                                elif order.status == "canceled":
+                                    self.stream.dispatch(self.CANCELED_ORDER, order=stored_order)
+                                elif order.status == "new":
+                                    self.stream.dispatch(self.NEW_ORDER, order=stored_order)
+
+
+                # Check for orders that are no longer in the broker's list
+                tracked_orders = {x.identifier: x for x in self.get_tracked_orders()}
+                broker_ids = [getattr(o, 'orderId', None) for o in raw_orders if hasattr(o, 'orderId')]
+
+                logger.debug(f"Schwab: Checking {len(tracked_orders)} tracked orders against {len(broker_ids)} broker order IDs")
+
+                for order_id, order in tracked_orders.items():
+                    if order_id not in broker_ids and order.is_active():
+                        # Instead of assuming cancellation, verify the order individually
+                        # This is much more robust than relying on timing or presence in bulk lists
+                        try:
+                            pass
+                            # Try to fetch this specific order from Alpaca
+                            # individual_order = self.api.get_order_by_id(order_id)
+                            # logger.debug(f"OAuth Polling: Individual lookup found order {order_id} with status {individual_order.status}")
+
+                            # # Update status based on individual lookup
+                            # if individual_order.status != order.status:
+                            #     logger.debug(f"OAuth Polling: Individual order status changed - {order_id}: {order.status} -> {individual_order.status}")
+                            #     order.update_raw(individual_order)
+
+                            #     # Dispatch appropriate event based on new status
+                            #     if individual_order.status in ["filled", "fill"]:
+                            #         # Get price and quantity with proper fallbacks for Alpaca API
+                            #         price = (getattr(individual_order, 'filled_avg_price', None) or
+                            #             getattr(individual_order, 'avg_fill_price', None) or
+                            #             getattr(order, 'limit_price', None))
+                            #         filled_qty = (getattr(individual_order, 'filled_qty', None) or
+                            #                     getattr(individual_order, 'qty', None) or
+                            #                     getattr(order, 'quantity', None))
+                            #         self.stream.dispatch(self.FILLED_ORDER, order=order, price=price, filled_quantity=filled_qty)
+                            #     elif individual_order.status == "canceled":
+                            #         self.stream.dispatch(self.CANCELED_ORDER, order=order)
+
+                        except Exception as e:
+                            if "404" in str(e) or "not found" in str(e).lower():
+                                # Order truly doesn't exist - it was cancelled/rejected
+                                logger.debug(f"OAuth Polling: Order {order_id} not found at broker, marking as cancelled")
+                                self.stream.dispatch(self.CANCELED_ORDER, order=order)
+                            else:
+                                # Network/API error - don't assume anything, just log and continue
+                                logger.debug(f"OAuth Polling: Could not verify order {order_id}: {e}")
+
+
+
+
             except Exception:
                 logger.error(traceback.format_exc())
 
@@ -1144,6 +1234,455 @@ class Schwab(Broker):
 
         # First time initialization - sync positions
         self.sync_positions(None)
+
+    def _submit_orders(self, orders, is_multileg=False, order_type=None, duration="day", price=None):
+        """
+        Submit multiple orders to the broker. Supports multi-leg orders for options.
+
+        Parameters
+        ----------
+        orders : list[Order]
+            List of orders to submit
+        is_multileg : bool, optional
+            Whether this is a multileg order (default: False)
+        order_type : str, optional
+            Order type for multileg orders (e.g., "limit", "market")
+        duration : str, optional
+            Time in force for the order (default: "day")
+        price : float, optional
+            Limit price for multileg orders
+
+        Returns
+        -------
+        list[Order] or Order
+            List of submitted orders, or a single parent order for multileg
+        """
+        if not orders or len(orders) == 0:
+            return []
+
+        if is_multileg:
+            # Submit as a multileg order
+            tag = orders[0].tag if hasattr(orders[0], "tag") and orders[0].tag else orders[0].strategy
+            parent_order = self._submit_multileg_order(orders, order_type, duration, price, tag)
+            return [parent_order] if parent_order else []
+        else:
+            # Submit orders individually
+            sub_orders = []
+            for order in orders:
+                submitted_order = self._submit_order(order)
+                if submitted_order:
+                    sub_orders.append(submitted_order)
+            return sub_orders
+
+    def _map_order_side_to_instruction(self, order_side, asset_type):
+        """
+        Map Lumibot order side to Schwab instruction type.
+
+        Parameters
+        ----------
+        order_side : str
+            Lumibot order side (BUY, SELL, BUY_TO_OPEN, SELL_TO_OPEN, BUY_TO_CLOSE, SELL_TO_CLOSE)
+        asset_type : str
+            Asset type (STOCK or OPTION)
+
+        Returns
+        -------
+        OptionInstruction or EquityInstruction
+            Schwab instruction type enum value
+
+        Raises
+        ------
+        ValueError
+            If the order side cannot be mapped to a valid Schwab instruction for the given asset type
+        """
+        try:
+            from schwab.orders.common import OptionInstruction, EquityInstruction
+        except ImportError:
+            raise ImportError("Could not import OptionInstruction or EquityInstruction from schwab.orders.common")
+
+        if asset_type == Asset.AssetType.OPTION:
+            # Option instructions
+            instruction_map = {
+                Order.OrderSide.BUY_TO_OPEN: OptionInstruction.BUY_TO_OPEN,
+                Order.OrderSide.SELL_TO_OPEN: OptionInstruction.SELL_TO_OPEN,
+                Order.OrderSide.BUY_TO_CLOSE: OptionInstruction.BUY_TO_CLOSE,
+                Order.OrderSide.SELL_TO_CLOSE: OptionInstruction.SELL_TO_CLOSE,
+                # Generic BUY/SELL for options
+                Order.OrderSide.BUY: OptionInstruction.BUY_TO_OPEN,
+                Order.OrderSide.SELL: OptionInstruction.SELL_TO_OPEN,
+            }
+        else:
+            # Equity instructions
+            instruction_map = {
+                Order.OrderSide.BUY: EquityInstruction.BUY,
+                Order.OrderSide.SELL: EquityInstruction.SELL,
+                Order.OrderSide.BUY_TO_COVER: EquityInstruction.BUY_TO_COVER,
+                Order.OrderSide.SELL_SHORT: EquityInstruction.SELL_SHORT,
+            }
+
+        if order_side not in instruction_map:
+            raise ValueError(
+                f"Cannot map order side '{order_side}' to Schwab instruction for asset type '{asset_type}'. "
+                f"Valid sides for {asset_type} are: {', '.join(str(k) for k in instruction_map.keys())}"
+            )
+
+        return instruction_map[order_side]
+
+    def _detect_option_strategy(self, orders):
+        """
+        Detect the option strategy type based on the order legs.
+
+        Analyzes the characteristics of multileg orders to identify specific strategies
+        like vertical spreads, calendar spreads, iron condors, straddles, etc.
+
+        Parameters
+        ----------
+        orders : list[Order]
+            List of orders representing the legs of the multileg order
+
+        Returns
+        -------
+        ComplexOrderStrategyType or None
+            The detected strategy type, or None if unable to determine
+        """
+        try:
+            from schwab.orders.common import ComplexOrderStrategyType
+        except ImportError:
+            logger.warning(colored("Could not import ComplexOrderStrategyType", "yellow"))
+            return None
+
+        if not orders or len(orders) < 2:
+            return None
+
+        num_legs = len(orders)
+
+        # Extract key characteristics from the orders
+        strikes = []
+        expirations = []
+        sides = []  # BUY_TO_OPEN, SELL_TO_OPEN, BUY_TO_CLOSE, SELL_TO_CLOSE
+        call_count = 0
+        put_count = 0
+
+        for order in orders:
+            if order.asset.asset_type == Asset.AssetType.OPTION:
+                strikes.append(order.asset.strike)
+                expirations.append(order.asset.expiration)
+                sides.append(order.side)
+
+                if order.asset.right == 'CALL':
+                    call_count += 1
+                elif order.asset.right == 'PUT':
+                    put_count += 1
+
+        # Sort strikes for comparison
+        unique_strikes = sorted(set(strikes))
+        unique_expirations = set(expirations)
+
+        # Strategy detection logic
+
+        # STRADDLE: Same strike, same expiration, one call and one put, both same side
+        if (num_legs == 2 and len(unique_strikes) == 1 and len(unique_expirations) == 1 and
+            call_count == 1 and put_count == 1 and sides[0] == sides[1]):
+            return ComplexOrderStrategyType.STRADDLE
+
+        # STRANGLE: Different strikes, same expiration, one call and one put, both same side
+        if (num_legs == 2 and len(unique_strikes) == 2 and len(unique_expirations) == 1 and
+            call_count == 1 and put_count == 1 and sides[0] == sides[1]):
+            return ComplexOrderStrategyType.STRANGLE
+
+        # VERTICAL SPREAD: Same expiration, different strikes, same option type (all calls or all puts)
+        if (num_legs == 2 and len(unique_expirations) == 1 and len(unique_strikes) == 2 and
+            (call_count == 2 or put_count == 2)):
+            return ComplexOrderStrategyType.VERTICAL
+
+        # CALENDAR SPREAD: Same strike, different expirations, same option type
+        if (num_legs == 2 and len(unique_strikes) == 1 and len(unique_expirations) == 2 and
+            (call_count == 2 or put_count == 2)):
+            return ComplexOrderStrategyType.CALENDAR
+
+        # DIAGONAL SPREAD: Different strikes, different expirations, same option type
+        if (num_legs == 2 and len(unique_strikes) == 2 and len(unique_expirations) == 2 and
+            (call_count == 2 or put_count == 2)):
+            return ComplexOrderStrategyType.DIAGONAL
+
+        # BUTTERFLY SPREAD: 3 legs, same expiration, 3 different strikes (typically 1-2-1 ratio)
+        if (num_legs == 3 and len(unique_expirations) == 1 and len(unique_strikes) == 3 and
+            (call_count == 3 or put_count == 3)):
+            return ComplexOrderStrategyType.BUTTERFLY
+
+        # CONDOR SPREAD: 4 legs, same expiration, 4 different strikes, same option type
+        if (num_legs == 4 and len(unique_expirations) == 1 and len(unique_strikes) == 4 and
+            (call_count == 4 or put_count == 4)):
+            return ComplexOrderStrategyType.CONDOR
+
+        # IRON CONDOR: 4 legs, same expiration, 4 different strikes, 2 calls and 2 puts
+        if (num_legs == 4 and len(unique_expirations) == 1 and len(unique_strikes) == 4 and
+            call_count == 2 and put_count == 2):
+            return ComplexOrderStrategyType.IRON_CONDOR
+
+        # COVERED CALL: 2 legs, one stock and one call option
+        stock_count = sum(1 for o in orders if o.asset.asset_type == Asset.AssetType.STOCK)
+        if num_legs == 2 and stock_count == 1 and call_count == 1:
+            return ComplexOrderStrategyType.COVERED
+
+        # COLLAR: 3 legs, one stock, one call, one put
+        if num_legs == 3 and stock_count == 1 and call_count == 1 and put_count == 1:
+            return ComplexOrderStrategyType.COLLAR_WITH_STOCK
+
+        # BACK RATIO: 2 legs, same expiration, same option type, but different quantities
+        # (typically 1 short and 2 long of same type)
+        if (num_legs == 2 and len(unique_expirations) == 1 and
+            (call_count == 2 or put_count == 2)):
+            # Check if quantities differ (indicating a ratio spread)
+            quantities = [o.quantity for o in orders]
+            if len(set(quantities)) > 1:
+                return ComplexOrderStrategyType.BACK_RATIO
+
+        # Default to CUSTOM for any other multileg strategy
+        return ComplexOrderStrategyType.CUSTOM
+
+    def _submit_multileg_order(self, orders, order_type="limit", duration="day", price=None, tag=None):
+        """
+        Submit a multi-leg options order to Schwab using OrderBuilder.
+
+        Parameters
+        ----------
+        orders : list[Order]
+            List of orders representing the legs of the multileg order
+        order_type : str, optional
+            Order type (default: "limit")
+        duration : str, optional
+            Time in force (default: "day")
+        price : float, optional
+            Limit price for the multileg order
+        tag : str, optional
+            Tag for the order
+
+        Returns
+        -------
+        Order
+            The parent multileg order with child orders, or None if submission failed
+        """
+        # Add check for authorization error first
+        if self.schwab_authorization_error:
+            logger.error(colored(f"Schwab authorization failed previously. Cannot submit multileg order.", "red"))
+            for o in orders:
+                o.set_error("Schwab authorization failed")
+            return None
+
+        # Add check for valid client and hash_value
+        if not self.client or not self.hash_value:
+            logger.error(colored(f"Schwab client or account hash not initialized. Cannot submit multileg order.", "red"))
+            for o in orders:
+                o.set_error("Schwab client/hash not initialized")
+            return None
+
+        try:
+            # Import required Schwab order classes
+            from schwab.orders.generic import OrderBuilder
+            from schwab.orders.common import Duration, Session, OrderStrategyType, OrderType
+            from schwab.orders.options import OptionSymbol
+
+            # All legs must have the same underlying symbol
+            symbol = orders[0].asset.symbol
+
+            # Create OrderBuilder
+            order_builder = OrderBuilder()
+
+            first_leg_type = orders[0].asset.asset_type
+
+            # Add legs to the order
+            for order in orders:
+                if order.asset.asset_type != first_leg_type:
+                    logger.error(colored(f"Multileg orders must all be the same asset type. Got {order.asset.asset_type} and {first_leg_type}", "red"))
+                    for o in orders:
+                        o.set_error("Multileg orders must all be the same asset type")
+                    return None
+
+                if order.asset.asset_type == Asset.AssetType.OPTION:
+                    # Build option symbol
+                    underlying_symbol = order.asset.symbol
+                    expiration_date = order.asset.expiration
+                    strike_price = order.asset.strike
+                    option_type = 'C' if order.asset.right == 'CALL' else 'P'
+
+                    # Create option symbol using Schwab's OptionSymbol builder
+                    option_symbol = OptionSymbol(
+                        underlying_symbol,
+                        expiration_date,
+                        option_type,
+                        f"{strike_price:.2f}"
+                    ).build()
+
+                    # Map Lumibot order side to Schwab instruction
+                    instruction = self._map_order_side_to_instruction(order.side, Asset.AssetType.OPTION)
+
+                    # Add the option leg
+                    order_builder = order_builder.add_option_leg(instruction, option_symbol, int(order.quantity))
+                elif order.asset.asset_type == Asset.AssetType.STOCK:
+                    # Map Lumibot order side to Schwab instruction for equities
+                    instruction = self._map_order_side_to_instruction(order.side, Asset.AssetType.STOCK)
+
+                    # Add the equity leg
+                    order_builder = order_builder.add_equity_leg(instruction, order.asset.symbol, int(order.quantity))
+                else:
+                    logger.error(colored(f"Multileg orders support options and equities. Got {order.asset.asset_type}", "red"))
+                    for o in orders:
+                        o.set_error("Multileg orders only support options")
+                    return None
+
+            # Set order type
+            if order_type == Order.OrderType.LIMIT and first_leg_type == Asset.AssetType.OPTION and len(orders) > 1:
+                #loop through all orders and check for a limit_price. If they do not have one, error
+                for order in orders:
+                    if order.limit_price is None:
+                        logger.error(colored(f"Limit price is required for multileg option orders on Schwab ONLY for calculating net debit/credit.", "red"))
+                        for o in orders:
+                            o.set_error("Limit price is required for multileg option orders")
+                        return None
+                
+                #sum the limit prices together to get the total price
+                total_price = 0
+                for order in orders:
+                    if order.side == "buy":
+                        total_price += order.limit_price * order.quantity
+                    else:
+                        total_price -= order.limit_price * order.quantity
+
+                if total_price < 0:
+                    order_builder = order_builder.set_order_type(OrderType.NET_CREDIT)
+                else:
+                    order_builder = order_builder.set_order_type(OrderType.NET_DEBIT)
+
+                # For limit orders, price is required
+                if price is None:
+                    raise ValueError("limit price is required for limit orders (multi-leg) on Schwab.")
+
+                # Set the limit price
+                order_builder = order_builder.set_price(round(float(price), 2))
+
+            elif order_type and order_type == Order.OrderType.LIMIT:
+                order_builder = order_builder.set_order_type(OrderType.LIMIT)
+
+                # For limit orders, price is required
+                if price is None:
+                    raise ValueError("limit price is required for limit orders (multi-leg) on Schwab.")
+
+                # Set the limit price
+                #convert price to string with 2 decimals
+                price_str = f"{price:.2f}"
+                order_builder = order_builder.set_price(price_str)
+            else:
+                # Default to market order
+                order_builder = order_builder.set_order_type(OrderType.MARKET)
+
+            # Set duration
+            if duration == "gtc":
+                order_builder = order_builder.set_duration(Duration.GOOD_TILL_CANCEL)
+            elif duration == "opg":
+                order_builder = order_builder.set_duration(Duration.ON_THE_OPEN)
+            elif duration == "cls":
+                order_builder = order_builder.set_duration(Duration.ON_THE_CLOSE)
+            else:  # default to "day"
+                order_builder = order_builder.set_duration(Duration.DAY)
+
+            # Set session
+            order_builder = order_builder.set_session(Session.NORMAL)
+
+            # Set special instruction to ALL_OR_NONE
+            # Got errer: Order with multiple legs must not have special instructions
+            # order_builder = order_builder.set_special_instruction(SpecialInstruction.ALL_OR_NONE)
+
+            # Set order strategy type
+            order_builder = order_builder.set_order_strategy_type(OrderStrategyType.SINGLE)
+
+            # Determine complex order strategy type based on order characteristics
+            strategy_type = self._detect_option_strategy(orders)
+            #if strategy_type:
+                #order_builder = order_builder.set_complex_order_strategy_type(strategy_type)
+
+            # Build the order spec
+            order_spec = order_builder.build()
+
+            # IMPORTANT: Verify that we don't have a nested 'order_spec' inside the order_spec
+            if "order_spec" in order_spec:
+                order_spec = order_spec["order_spec"]
+
+            # Log the order
+            logger.info(colored(f"Sending multileg order to Schwab: {symbol} with {len(orders)} legs @ {price or 'market'}", "cyan"))
+            logger.info(colored(f"Order spec: {json.dumps(order_spec, indent=2)}", "cyan"))
+            # Submit the order to Schwab
+            response = self.client.place_order(self.hash_value, order_spec)
+
+            # Log the response
+            logger.info(colored(f"Schwab multileg order response status: {response.status_code}", "cyan"))
+
+            if response.status_code not in [200, 201]:
+                error_msg = f"Failed to submit multileg order: {response.status_code} - {response.text}"
+                logger.error(colored(error_msg, "red"))
+                for o in orders:
+                    o.set_error(error_msg)
+                return None
+
+            # Extract order ID from response
+            order_id = None
+            try:
+                from schwab.utils import Utils
+                utils_instance = Utils(self.client, self.hash_value)
+                order_id = utils_instance.extract_order_id(response)
+                if order_id:
+                    logger.info(colored(f"Extracted multileg order ID: {order_id}", "green"))
+            except (ImportError, Exception) as e:
+                logger.warning(colored(f"Could not use Utils.extract_order_id: {e}", "yellow"))
+
+            # Fallback methods if Utils.extract_order_id fails
+            if not order_id and hasattr(response, 'headers') and 'Location' in response.headers:
+                location = response.headers.get('Location', '')
+                order_id = location.split('/')[-1] if '/' in location else location.strip()
+                logger.info(colored(f"Extracted multileg order ID from Location header: {order_id}", "green"))
+
+            if not order_id:
+                logger.error(colored("Failed to get multileg order ID from response", "red"))
+                for o in orders:
+                    o.set_error("Failed to extract order ID from response")
+                return None
+
+            # Create parent order
+            parent_asset = Asset(symbol=symbol)
+            parent_order = Order(
+                identifier=order_id,
+                asset=parent_asset,
+                strategy=orders[0].strategy,
+                order_class=Order.OrderClass.MULTILEG,
+                side=orders[0].side,
+                quantity=orders[0].quantity,
+                order_type=orders[0].order_type,
+                time_in_force=duration,
+                limit_price=price,
+                tag=tag,
+                status=Order.OrderStatus.SUBMITTED
+            )
+
+            # Set parent identifier for all child orders
+            for o in orders:
+                o.parent_identifier = parent_order.identifier
+
+            parent_order.child_orders = orders
+            parent_order.update_raw({"id": order_id, "status": "SUBMITTED"})
+
+            # Add to unprocessed orders and dispatch to stream
+            self._unprocessed_orders.append(parent_order)
+            self.stream.dispatch(self.NEW_ORDER, order=parent_order)
+
+            return parent_order
+
+        except Exception as e:
+            error_msg = f"Error submitting multileg order: {str(e)}"
+            logger.error(colored(error_msg, "red"))
+            logger.error(traceback.format_exc())
+            for o in orders:
+                o.set_error(error_msg)
+            return None
 
     def _submit_order(self, order: Order) -> Order:
         """
