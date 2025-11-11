@@ -863,6 +863,22 @@ def _fetch_and_update_futures_multiplier(
             logger.debug(f"[MULTIPLIER] AFTER update: asset.multiplier = {asset.multiplier}")
         else:
             logger.error(f"[MULTIPLIER] ✗ Definition missing unit_of_measure_qty field! Fields: {list(definition.keys())}")
+
+        if (
+            asset.asset_type == Asset.AssetType.FUTURE
+            and getattr(asset, "expiration", None) in (None, "")
+        ):
+            expiration_value = definition.get('expiration')
+            if expiration_value:
+                try:
+                    expiration_ts = pd.to_datetime(expiration_value, utc=True, errors='coerce')
+                except Exception as exc:
+                    logger.debug(f"[MULTIPLIER] Unable to parse expiration '{expiration_value}' for {asset.symbol}: {exc}")
+                    expiration_ts = None
+
+                if expiration_ts is not None and not pd.isna(expiration_ts):
+                    asset.expiration = expiration_ts.date()
+                    logger.debug(f"[MULTIPLIER] ✓ Captured expiration for {asset.symbol}: {asset.expiration}")
     else:
         logger.error(f"[MULTIPLIER] ✗ Failed to get definition from DataBento for {resolved_symbol}")
 
@@ -1046,8 +1062,10 @@ def get_price_data_from_databento(
                 logger.warning(f"No datetime column found after reset_index, using first column: {first_col}")
                 combined_reset = combined_reset.rename(columns={first_col: 'datetime'})
 
-        # Convert to polars
+        # Convert to polars and normalize datetime metadata
         combined_polars = pl.from_pandas(combined_reset)
+        combined_polars = _ensure_polars_datetime_timezone(combined_polars)
+        combined_polars = _ensure_polars_datetime_precision(combined_polars)
 
         return combined_polars
 
@@ -1239,6 +1257,8 @@ def _generate_databento_symbol_alternatives(base_symbol: str, resolved_contract:
         # Fallback for unexpected contract format - use original contract
         logger.warning(f"Unexpected contract format: {resolved_contract}, using as-is")
         return [resolved_contract]
+
+
 def _ensure_polars_datetime_timezone(df: pl.DataFrame, column: str = "datetime") -> pl.DataFrame:
     """Ensure the specified datetime column is timezone-aware (defaults to UTC)."""
     if column not in df.columns:
@@ -1249,6 +1269,26 @@ def _ensure_polars_datetime_timezone(df: pl.DataFrame, column: str = "datetime")
     if isinstance(col_dtype, pl.Datetime):
         return df.with_columns(pl.col(column).dt.replace_time_zone("UTC"))
     return df
+
+
+def _ensure_polars_datetime_precision(
+    df: pl.DataFrame,
+    column: str = "datetime",
+    time_unit: str = "ns",
+) -> pl.DataFrame:
+    """Normalize the precision of a datetime column (default nanosecond)."""
+    if column not in df.columns:
+        return df
+    col_dtype = df.schema.get(column)
+    if not isinstance(col_dtype, pl.Datetime):
+        return df
+    target_dtype = pl.Datetime(
+        time_unit=time_unit,
+        time_zone=col_dtype.time_zone or "UTC",
+    )
+    if col_dtype == target_dtype:
+        return df
+    return df.with_columns(pl.col(column).cast(target_dtype))
 
 
 def get_price_data_from_databento_polars(*args, **kwargs):
